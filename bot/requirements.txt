@@ -1,5 +1,7 @@
-pipecat-ai[deepgram,cartesia,groq,silero,webrtc]==1.2.1
+pipecat-ai[deepgram,cartesia,groq,silero,webrtc,elevenlabs]==1.2.1
 aiortc
 fastapi
 uvicorn[standard]
 python-dotenv
+# African-language STT/TTS for the Yoruba/Igbo voice modes (spitch_services.py).
+spitch

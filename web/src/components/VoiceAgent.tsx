@@ -58,6 +58,67 @@ const CONNECT_URL = (() => {
   }
 })();
 
+// Voice languages the user can switch between. `value` is the bot's mode (the
+// ?lang= query param read by server.py -> run_bot). english/spanish run on the
+// existing Deepgram+Cartesia stack; yoruba/igbo run on Spitch (needs
+// SPITCH_API_KEY on the bot). Switching reconnects with the new stack.
+const LANGUAGES = [
+  { value: "english", label: "English" },
+  { value: "nigerian_english", label: "Nigerian English" },
+  { value: "pidgin", label: "Pidgin" },
+  { value: "english_eleven", label: "English (ElevenLabs)" },
+  { value: "spanish", label: "Español" },
+  { value: "yoruba", label: "Yorùbá" },
+  { value: "igbo", label: "Igbo" },
+] as const;
+const DEFAULT_LANG = "english";
+const LANG_STORAGE_KEY = "vivid:lang";
+
+// Conversation styles (the bot's ?style= param -> run_bot). "companion" is the
+// default everyday persona; "story" has Vivid lead the conversation while you
+// mostly answer and flow. Switching reconnects with a fresh bot-side context,
+// exactly like switching language.
+const STYLES = [
+  { value: "companion", label: "Companion" },
+  { value: "story", label: "Story" },
+] as const;
+const DEFAULT_STYLE = "companion";
+const STYLE_STORAGE_KEY = "vivid:style";
+
+// Modes whose TTS voice is chosen in the UI (ElevenLabs). Must match the
+// voice_configurable modes in bot.py.
+const VOICE_MODES = new Set<string>(["english_eleven"]);
+const VOICE_STORAGE_KEY = "vivid:voice";
+
+// Longest-side pixel cap for a captured camera frame before it's sent to the bot's
+// vision model. Smaller = fewer vision tokens and a faster upload; 768 is plenty
+// for "what is this" recognition and reading short text.
+const MAX_FRAME_PX = 768;
+
+// Endpoint that lists the bot's ElevenLabs voices for the picker.
+const VOICES_URL = (() => {
+  try {
+    return new URL("/elevenlabs/voices", OFFER_URL).toString();
+  } catch {
+    return "http://localhost:7860/elevenlabs/voices";
+  }
+})();
+
+// Build the bot endpoint with the chosen language (and optional TTS voice). The
+// bot builds a fresh pipeline per connection, so these are read at connect time.
+function buildEndpoint(
+  url: string,
+  lang: string,
+  voice?: string,
+  style?: string,
+): string {
+  const u = new URL(url);
+  u.searchParams.set("lang", lang);
+  if (voice) u.searchParams.set("voice", voice);
+  if (style) u.searchParams.set("style", style);
+  return u.toString();
+}
+
 // @pipecat-ai/client-react bundles its own copy of the RTVIEvent enum (parcel
 // inlines it), which is nominally distinct from the one exported by client-js.
 // This thin wrapper centralizes the unavoidable cast in one place.
@@ -162,8 +223,77 @@ function VoiceAgentInner() {
   const [lines, setLines] = useState<TranscriptLine[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [inputRequest, setInputRequest] = useState<InputRequest | null>(null);
+  const [lang, setLang] = useState<string>(DEFAULT_LANG);
+  const [switching, setSwitching] = useState(false);
+  // Always holds the latest language so connect() (a stable callback) reads the
+  // current choice without being re-created on every change.
+  const langRef = useRef(lang);
+  const [style, setStyle] = useState<string>(DEFAULT_STYLE);
+  // Same latest-value ref trick as langRef so connect() reads the current style.
+  const styleRef = useRef(style);
+  const [voice, setVoice] = useState<string>("");
+  const [voices, setVoices] = useState<
+    { id: string; name: string; accent: string; category?: string }[]
+  >([]);
+  const voiceRef = useRef("");
   const lineId = useRef(0);
   const transcriptEndRef = useRef<HTMLDivElement>(null);
+  // Camera for the bot's `look` tool. We never add a video track to the WebRTC peer
+  // (audio-only via WavMediaManager); instead we grab a single frame on demand,
+  // downscale it, and send it over the data channel. The stream is opened lazily the
+  // first time the bot asks to look and stopped on disconnect/unmount.
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const camStreamRef = useRef<MediaStream | null>(null);
+  const [camActive, setCamActive] = useState(false);
+
+  const showVoicePicker = VOICE_MODES.has(lang);
+
+  // Restore the user's last language + voice on mount (persists across reloads).
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem(LANG_STORAGE_KEY);
+      if (saved) {
+        setLang(saved);
+        langRef.current = saved;
+      }
+      const savedStyle = localStorage.getItem(STYLE_STORAGE_KEY);
+      if (savedStyle) {
+        setStyle(savedStyle);
+        styleRef.current = savedStyle;
+      }
+      const savedVoice = localStorage.getItem(VOICE_STORAGE_KEY);
+      if (savedVoice) {
+        setVoice(savedVoice);
+        voiceRef.current = savedVoice;
+      }
+    } catch {
+      // localStorage unavailable (private mode / SSR) — fall back to defaults.
+    }
+  }, []);
+
+  // When a voice-configurable mode is active, load the bot's ElevenLabs voices
+  // and default to the first (the bot sorts Nigerian voices to the top).
+  useEffect(() => {
+    if (!showVoicePicker || voices.length) return;
+    let cancelled = false;
+    fetch(VOICES_URL)
+      .then((r) => r.json())
+      .then((d: { voices?: { id: string; name: string; accent: string; category?: string }[] }) => {
+        if (cancelled) return;
+        const list = d.voices ?? [];
+        setVoices(list);
+        if (!voiceRef.current && list.length) {
+          setVoice(list[0].id);
+          voiceRef.current = list[0].id;
+        }
+      })
+      .catch(() => {
+        /* bot offline or no key — picker just stays empty */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [showVoicePicker, voices.length]);
 
   const connected = transportState === "connected" || transportState === "ready";
   const connecting =
@@ -180,6 +310,73 @@ function VoiceAgentInner() {
       return [...prev, { id: lineId.current++, role, text }];
     });
   }, []);
+
+  // Open the camera (once) and return a <video> with frames flowing. Prefers the
+  // rear camera on mobile; desktop just has the one. Rejects if the user denies
+  // permission or has no camera — captureFrame turns that into a "no image".
+  const ensureCamera = useCallback(async (): Promise<HTMLVideoElement> => {
+    const v = videoRef.current;
+    if (!v) throw new Error("camera video element not mounted");
+    if (!camStreamRef.current) {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: "environment" } },
+      });
+      camStreamRef.current = stream;
+      v.srcObject = stream;
+      setCamActive(true);
+    }
+    // Wait until a frame is actually decodable so drawImage has real pixels.
+    if (v.readyState < 2) {
+      await v.play().catch(() => {});
+      await new Promise<void>((resolve) => {
+        if (v.readyState >= 2) return resolve();
+        const onReady = () => {
+          v.removeEventListener("loadeddata", onReady);
+          resolve();
+        };
+        v.addEventListener("loadeddata", onReady);
+      });
+    }
+    return v;
+  }, []);
+
+  // Stop the camera and clear the "on" indicator.
+  const stopCamera = useCallback(() => {
+    camStreamRef.current?.getTracks().forEach((t) => t.stop());
+    camStreamRef.current = null;
+    if (videoRef.current) videoRef.current.srcObject = null;
+    setCamActive(false);
+  }, []);
+
+  // Grab one frame for the bot's `look` tool: draw the current video frame to a
+  // canvas, downscale (longest side -> MAX_FRAME_PX), JPEG-encode, and send the
+  // base64 back over the data channel. On any failure send image:null so the bot's
+  // parked tool call resolves as "no image" rather than waiting out its timeout.
+  const captureFrame = useCallback(
+    async (id: string) => {
+      try {
+        const video = await ensureCamera();
+        const vw = video.videoWidth;
+        const vh = video.videoHeight;
+        if (!vw || !vh) throw new Error("no video frame yet");
+        const scale = Math.min(1, MAX_FRAME_PX / Math.max(vw, vh));
+        const w = Math.round(vw * scale);
+        const h = Math.round(vh * scale);
+        const canvas = document.createElement("canvas");
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) throw new Error("no 2d canvas context");
+        ctx.drawImage(video, 0, 0, w, h);
+        const b64 = canvas.toDataURL("image/jpeg", 0.6).split(",")[1] || null;
+        client?.sendClientMessage("frame_response", { id, image: b64 });
+      } catch (e) {
+        console.warn("[voice] camera frame capture failed:", e);
+        client?.sendClientMessage("frame_response", { id, image: null });
+      }
+    },
+    [client, ensureCamera],
+  );
 
   // --- RTVI events -> status + transcript ----------------------------------
   useVoiceEvent(
@@ -233,8 +430,11 @@ function VoiceAgentInner() {
         setInputRequest({ id: data.id, prompt: data.prompt ?? "", label: data.label });
       } else if (data?.type === "close_user_input") {
         setInputRequest((cur) => (!data.id || cur?.id === data.id ? null : cur));
+      } else if (data?.type === "capture_frame" && data.id) {
+        // The bot's `look` tool is asking for a camera frame — grab and return one.
+        void captureFrame(data.id);
       }
-    }, []),
+    }, [captureFrame]),
   );
 
   // Reply to a request_user_input box: send the typed value back (null = cancel)
@@ -251,6 +451,9 @@ function VoiceAgentInner() {
     transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [lines]);
 
+  // Release the camera if we unmount mid-session.
+  useEffect(() => () => stopCamera(), [stopCamera]);
+
   // --- session control -----------------------------------------------------
   const connect = useCallback(async () => {
     if (!client) return;
@@ -265,17 +468,26 @@ function VoiceAgentInner() {
       );
     }, 12000);
     try {
+      // Only send a voice for voice-configurable modes (ElevenLabs); others ignore it.
+      const v = VOICE_MODES.has(langRef.current) ? voiceRef.current : undefined;
       if (TRANSPORT === "daily") {
         // Ask the bot to create a Daily room + token, then join it.
-        const res = await fetch(CONNECT_URL, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: "{}",
-        });
+        const res = await fetch(
+          buildEndpoint(CONNECT_URL, langRef.current, v, styleRef.current),
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: "{}",
+          },
+        );
         if (!res.ok) throw new Error(`Bot /connect failed: ${res.status}`);
         await client.connect(await res.json());
       } else {
-        await client.connect({ webrtcRequestParams: { endpoint: OFFER_URL } });
+        await client.connect({
+          webrtcRequestParams: {
+            endpoint: buildEndpoint(OFFER_URL, langRef.current, v, styleRef.current),
+          },
+        });
       }
       // Listen continuously so the bot's wake filter can hear "Hey Vivid".
       client.enableMic(true);
@@ -303,9 +515,83 @@ function VoiceAgentInner() {
   const disconnect = useCallback(async () => {
     if (!client) return;
     setConversing(false);
+    stopCamera();
     await client.disconnect();
     setStatus("idle");
-  }, [client]);
+  }, [client, stopCamera]);
+
+  // Change the voice language. Persists the choice immediately so it applies to
+  // the next connect. If a session is live, reconnect so the bot rebuilds its
+  // pipeline with the new STT/TTS stack (Pipecat can't hot-swap a running
+  // graph). Note: a switch starts a fresh bot-side conversation context.
+  const switchLanguage = useCallback(
+    async (next: string) => {
+      if (next === langRef.current) return;
+      setLang(next);
+      langRef.current = next;
+      try {
+        localStorage.setItem(LANG_STORAGE_KEY, next);
+      } catch {
+        // Non-fatal: choice just won't persist across reloads.
+      }
+      if (!client || !connected) return; // not live yet — applies on next connect
+      setSwitching(true);
+      try {
+        await client.disconnect();
+        await connect();
+      } finally {
+        setSwitching(false);
+      }
+    },
+    [client, connected, connect],
+  );
+
+  // Change the ElevenLabs voice (same reconnect dance as switching language).
+  const switchVoice = useCallback(
+    async (next: string) => {
+      if (next === voiceRef.current) return;
+      setVoice(next);
+      voiceRef.current = next;
+      try {
+        localStorage.setItem(VOICE_STORAGE_KEY, next);
+      } catch {
+        // Non-fatal: choice just won't persist across reloads.
+      }
+      if (!client || !connected) return;
+      setSwitching(true);
+      try {
+        await client.disconnect();
+        await connect();
+      } finally {
+        setSwitching(false);
+      }
+    },
+    [client, connected, connect],
+  );
+
+  // Change the conversation style (companion/story). Same reconnect dance as
+  // language — the bot rebuilds with the new persona and a fresh context.
+  const switchStyle = useCallback(
+    async (next: string) => {
+      if (next === styleRef.current) return;
+      setStyle(next);
+      styleRef.current = next;
+      try {
+        localStorage.setItem(STYLE_STORAGE_KEY, next);
+      } catch {
+        // Non-fatal: choice just won't persist across reloads.
+      }
+      if (!client || !connected) return;
+      setSwitching(true);
+      try {
+        await client.disconnect();
+        await connect();
+      } finally {
+        setSwitching(false);
+      }
+    },
+    [client, connected, connect],
+  );
 
   // Hands-free conversation: open the mic and let the bot's VAD drive turns.
   // The wake word will later call startConversation() instead of a button.
@@ -356,6 +642,82 @@ function VoiceAgentInner() {
             End session
           </button>
         )}
+
+        {/* Language switcher. Changing it reconnects the session with the new
+            STT/TTS stack; works before a session too (applies on connect). */}
+        <label className="sr-only" htmlFor="voice-lang">
+          Voice language
+        </label>
+        <select
+          id="voice-lang"
+          value={lang}
+          onChange={(e) => switchLanguage(e.target.value)}
+          disabled={connecting || switching}
+          className="rounded-md border border-gray-300 px-2 py-2 text-sm disabled:opacity-50 dark:border-gray-600 dark:bg-gray-800"
+        >
+          {LANGUAGES.map((l) => (
+            <option key={l.value} value={l.value}>
+              {l.label}
+            </option>
+          ))}
+        </select>
+
+        {/* ElevenLabs voice picker — only for voice-configurable modes. */}
+        {showVoicePicker && (
+          <select
+            aria-label="Voice"
+            value={voice}
+            onChange={(e) => switchVoice(e.target.value)}
+            disabled={connecting || switching || voices.length === 0}
+            className="rounded-md border border-gray-300 px-2 py-2 text-sm disabled:opacity-50 dark:border-gray-600 dark:bg-gray-800"
+          >
+            {voices.length === 0 ? (
+              <option>Loading voices…</option>
+            ) : (
+              voices.map((v) => (
+                <option key={v.id} value={v.id}>
+                  {v.name}
+                  {v.accent ? ` · ${v.accent}` : ""}
+                  {v.category && v.category !== "premade" ? " — paid plan" : ""}
+                </option>
+              ))
+            )}
+          </select>
+        )}
+
+        {/* Conversation style — Companion (default) or Story (Vivid leads).
+            Switching reconnects, which restarts the conversation. */}
+        <label className="sr-only" htmlFor="voice-style">
+          Conversation style
+        </label>
+        <select
+          id="voice-style"
+          value={style}
+          onChange={(e) => switchStyle(e.target.value)}
+          disabled={connecting || switching}
+          title="Switching restarts the conversation"
+          className="rounded-md border border-gray-300 px-2 py-2 text-sm disabled:opacity-50 dark:border-gray-600 dark:bg-gray-800"
+        >
+          {STYLES.map((s) => (
+            <option key={s.value} value={s.value}>
+              {s.label}
+            </option>
+          ))}
+        </select>
+
+        {switching && (
+          <span className="text-xs text-gray-500">Switching…</span>
+        )}
+
+        {camActive && (
+          <span
+            className="text-xs text-gray-500"
+            title="Camera is on for the look tool"
+          >
+            📷 camera on
+          </span>
+        )}
+
         <span className="text-xs text-gray-500">transport: {transportState}</span>
       </div>
 
@@ -411,6 +773,10 @@ function VoiceAgentInner() {
           onCancel={() => respondToInput(inputRequest.id, null)}
         />
       )}
+
+      {/* Hidden camera sink for the `look` tool. Frames are grabbed to a canvas on
+          demand; this stream is never added to the WebRTC peer connection. */}
+      <video ref={videoRef} className="hidden" muted playsInline />
     </div>
   );
 }

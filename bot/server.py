@@ -97,7 +97,17 @@ async def health():
 
 
 @app.post("/api/offer")
-async def offer(request: dict, background_tasks: BackgroundTasks):
+async def offer(
+    request: dict,
+    background_tasks: BackgroundTasks,
+    lang: str = "english",
+    voice: str = "",
+    style: str = "companion",
+):
+    # `lang` (query param) selects the voice language mode; `voice` is an optional
+    # per-session TTS voice (ElevenLabs voice id picked in the UI); `style` selects
+    # the conversation persona (companion/story). The browser appends
+    # ?lang=...&voice=...&style=... so switching any of them is just a reconnect.
     # Spawn the pipeline only for a brand-new connection (not on renegotiation).
     # add_task runs after the answer is returned, so the offer isn't blocked.
     async def on_new_connection(connection):
@@ -105,7 +115,9 @@ async def offer(request: dict, background_tasks: BackgroundTasks):
             webrtc_connection=connection,
             params=TransportParams(audio_in_enabled=True, audio_out_enabled=True),
         )
-        background_tasks.add_task(run_bot, transport)
+        background_tasks.add_task(
+            run_bot, transport, mode=lang, voice=voice or None, style=style
+        )
 
     return await webrtc.handle_web_request(
         SmallWebRTCRequest.from_dict(request), on_new_connection
@@ -121,8 +133,54 @@ async def offer_patch(request: dict):
     return {"status": "ok"}
 
 
+@app.get("/elevenlabs/voices")
+async def elevenlabs_voices():
+    """List the account's ElevenLabs voices so the web UI can offer a picker.
+
+    Returns [{id, name, accent}]. Empty list (not an error) if no key is set, so
+    the UI can just show nothing rather than break.
+    """
+    import aiohttp
+
+    key = os.environ.get("ELEVENLABS_API_KEY")
+    if not key:
+        return {"voices": []}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://api.elevenlabs.io/v1/voices", headers={"xi-api-key": key}
+            ) as resp:
+                if resp.status >= 400:
+                    logger.warning(f"ElevenLabs /voices error {resp.status}")
+                    return {"voices": []}
+                data = await resp.json()
+    except Exception as e:
+        logger.warning(f"Failed to list ElevenLabs voices: {e}")
+        return {"voices": []}
+
+    voices = [
+        {
+            "id": v["voice_id"],
+            "name": v.get("name", ""),
+            "accent": (v.get("labels") or {}).get("accent", ""),
+            "category": v.get("category", ""),
+        }
+        for v in data.get("voices", [])
+    ]
+    # Premade voices work on the free tier via the API; library voices (category
+    # "professional"/"generated", e.g. the Nigerian one) need a paid ElevenLabs
+    # plan. Sort the free-usable premade voices first so the default is playable.
+    voices.sort(key=lambda v: (v["category"] != "premade", v["name"].lower()))
+    return {"voices": voices}
+
+
 @app.post("/connect")
-async def connect(background_tasks: BackgroundTasks):
+async def connect(
+    background_tasks: BackgroundTasks,
+    lang: str = "english",
+    voice: str = "",
+    style: str = "companion",
+):
     """Daily transport: create a room + tokens, spawn the bot, return client creds.
 
     Daily imports are deferred so SmallWebRTC-only setups (e.g. local Windows,
@@ -158,7 +216,9 @@ async def connect(background_tasks: BackgroundTasks):
         "Vivid",
         DailyParams(audio_in_enabled=True, audio_out_enabled=True),
     )
-    background_tasks.add_task(run_bot, transport)
+    background_tasks.add_task(
+        run_bot, transport, mode=lang, voice=voice or None, style=style
+    )
     # The browser joins the same room with its own token.
     return {"room_url": room.url, "token": client_token}
 
