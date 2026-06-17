@@ -14,6 +14,9 @@ COPY . .
 # not just as a runtime env var.
 ARG NEXT_PUBLIC_BOT_OFFER_URL
 ENV NEXT_PUBLIC_BOT_OFFER_URL=$NEXT_PUBLIC_BOT_OFFER_URL
+# JSON array of ICE servers (STUN/TURN) for the browser peer connection.
+ARG NEXT_PUBLIC_WEBRTC_ICE_SERVERS
+ENV NEXT_PUBLIC_WEBRTC_ICE_SERVERS=$NEXT_PUBLIC_WEBRTC_ICE_SERVERS
 RUN npm run build
 
 FROM node:24-alpine AS runner

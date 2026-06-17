@@ -23,6 +23,25 @@ import {
 const OFFER_URL =
   process.env.NEXT_PUBLIC_BOT_OFFER_URL ?? "http://localhost:7860/api/offer";
 
+// ICE servers for the browser peer connection. Without these the browser only
+// gathers host/LAN candidates and never connects to a bot behind NAT/Docker.
+// Set NEXT_PUBLIC_WEBRTC_ICE_SERVERS (build-time JSON) to add TURN in prod —
+// must match the bot's WEBRTC_ICE_SERVERS. Defaults to public STUN.
+function parseIceServers(): RTCIceServer[] {
+  const raw = process.env.NEXT_PUBLIC_WEBRTC_ICE_SERVERS;
+  const fallback: RTCIceServer[] = [{ urls: "stun:stun.l.google.com:19302" }];
+  if (!raw) return fallback;
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) && parsed.length ? parsed : fallback;
+  } catch {
+    console.warn("[voice] NEXT_PUBLIC_WEBRTC_ICE_SERVERS is not valid JSON; using STUN.");
+    return fallback;
+  }
+}
+
+const ICE_SERVERS = parseIceServers();
+
 // @pipecat-ai/client-react bundles its own copy of the RTVIEvent enum (parcel
 // inlines it), which is nominally distinct from the one exported by client-js.
 // This thin wrapper centralizes the unavoidable cast in one place.
@@ -281,7 +300,10 @@ export default function VoiceAgent() {
       // SmallWebRTCTransport defaults to DailyMediaManager, which spins up a
       // Daily call object (loads Daily's call-machine bundle) and hangs on a
       // pure SmallWebRTC setup. WavMediaManager uses plain browser media.
-      transport: new SmallWebRTCTransport({ mediaManager: new WavMediaManager() }),
+      transport: new SmallWebRTCTransport({
+        mediaManager: new WavMediaManager(),
+        iceServers: ICE_SERVERS,
+      }),
       enableMic: false, // connect receive-only; PTT adds the mic track live
       enableCam: false,
     });
