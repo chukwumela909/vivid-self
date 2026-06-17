@@ -18,7 +18,7 @@ from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.frames.frames import LLMRunFrame
+from pipecat.frames.frames import LLMRunFrame, TTSSpeakFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
@@ -27,7 +27,6 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
 )
 from pipecat.processors.audio.vad_processor import VADProcessor
-from pipecat.processors.filters.wake_check_filter import WakeCheckFilter
 from pipecat.processors.frameworks.rtvi import RTVIObserver, RTVIProcessor
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.deepgram.stt import DeepgramSTTService, LiveOptions
@@ -132,6 +131,15 @@ async def send_email(params):
         )
         return
 
+    # Speak a quick filler the instant the send fires so the Resend round-trip
+    # never lands as dead air. Pushed downstream from the live LLM service, it goes
+    # straight to TTS (next in the pipeline); append_to_context=True records it so
+    # the model knows it already acknowledged and won't repeat itself. Placed after
+    # the key check so a misconfig doesn't say "sending" then "not configured".
+    await params.llm.push_frame(
+        TTSSpeakFrame("Sending that now…", append_to_context=True)
+    )
+
     payload = {"from": sender, "to": [to], "subject": subject, "text": body}
     try:
         async with aiohttp.ClientSession() as session:
@@ -201,6 +209,10 @@ async def run_bot(transport):
         settings=GroqLLMService.Settings(
             model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
             temperature=float(os.getenv("GROQ_TEMPERATURE", "0.4")),
+            # Bound worst-case turn length so a stray long reply can't blow up
+            # time-to-finish. Replies are already one short sentence; this is a
+            # ceiling, not a target.
+            max_completion_tokens=int(os.getenv("GROQ_MAX_TOKENS", "160")),
         ),
     )
 
@@ -294,32 +306,12 @@ async def run_bot(transport):
         if future and not future.done():
             future.set_result(data.get("value"))
 
-    # Wake word: the agent ignores all speech until it hears the wake word, then
-    # stays awake (passing turns to the LLM) until WAKE_KEEPALIVE seconds of no
-    # speech, after which it sleeps again. No external service / key required.
-    #
-    # Each phrase is matched as a word-boundary regex anywhere in the transcript,
-    # so the single word "vivid" already covers "hey vivid", "hello vivid",
-    # "ok vivid", etc. The extra entries are common Deepgram mishearings.
-    # Override with WAKE_PHRASES (comma-separated) without touching code.
-    wake_phrases_env = os.getenv("WAKE_PHRASES", "")
-    wake_phrases = [p.strip() for p in wake_phrases_env.split(",") if p.strip()] or [
-        "vivid",
-        "vivd",
-        "bivid",
-    ]
-    wake = WakeCheckFilter(
-        wake_phrases=wake_phrases,
-        keepalive_timeout=float(os.getenv("WAKE_KEEPALIVE", "30")),
-    )
-
     pipeline = Pipeline(
         [
             transport.input(),
             rtvi,
             vad,
             stt,
-            wake,  # gate: only pass user turns once "hey vivid" was heard
             context_aggregator.user(),
             llm,
             tts,
@@ -337,15 +329,13 @@ async def run_bot(transport):
     @rtvi.event_handler("on_client_ready")
     async def on_client_ready(rtvi):
         await rtvi.set_bot_ready()
-        # Greet once and tell the user the wake word. This LLMRunFrame is queued
-        # directly to the task, so it bypasses the wake gate (which only filters
-        # user transcriptions).
+        # Greet once so the user knows the bot is live and listening.
         messages.append(
             {
                 "role": "system",
                 "content": (
-                    "Greet the user in one short, friendly sentence and tell them "
-                    "to say 'Hey Vivid' whenever they want your help."
+                    "Greet the user in one short, friendly sentence and invite "
+                    "them to tell you what they'd like help with."
                 ),
             }
         )
