@@ -1,0 +1,21 @@
+# Secrets
+.env
+.env.local
+.env.*.local
+
+# Python
+bot/.venv/
+__pycache__/
+*.pyc
+
+# Node / Next.js
+web/node_modules/
+web/.next/
+web/out/
+web/build/
+node_modules/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.log

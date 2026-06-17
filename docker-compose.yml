@@ -1,0 +1,59 @@
+# Deploys the two services as one stack. In Coolify, add a "Docker Compose"
+# resource pointing at this file; set the env vars below in the Coolify UI
+# (Environment tab) and assign a domain to each service so Traefik terminates
+# HTTPS for you. Do NOT commit real secrets — they come from the environment.
+
+services:
+  bot:
+    build:
+      context: ./bot
+    environment:
+      # Provider keys (set these in Coolify, not here):
+      DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY}
+      GROQ_API_KEY: ${GROQ_API_KEY}
+      CARTESIA_API_KEY: ${CARTESIA_API_KEY}
+      CARTESIA_VOICE_ID: ${CARTESIA_VOICE_ID}
+      DEEPGRAM_MODEL: ${DEEPGRAM_MODEL:-nova-3}
+      GROQ_MODEL: ${GROQ_MODEL}
+      LLM_PROVIDER: ${LLM_PROVIDER:-groq}
+      BOT_PORT: "7860"
+      # WebRTC ICE — JSON array of STUN/TURN servers. STUN alone is enough for
+      # same-network testing; add your TURN entry (see coturn below) for
+      # reliable media from this bridged container. See DEPLOY.md.
+      WEBRTC_ICE_SERVERS: ${WEBRTC_ICE_SERVERS:-["stun:stun.l.google.com:19302"]}
+    expose:
+      - "7860"          # Coolify/Traefik proxies HTTPS -> 7860 (signaling)
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./web
+      args:
+        # Build-time: the public HTTPS URL of the bot's /api/offer endpoint,
+        # e.g. https://bot.yourdomain.com/api/offer
+        NEXT_PUBLIC_BOT_OFFER_URL: ${NEXT_PUBLIC_BOT_OFFER_URL}
+    expose:
+      - "3000"
+    depends_on:
+      - bot
+    restart: unless-stopped
+
+  # --- Optional: self-hosted TURN relay for reliable media -------------------
+  # Uncomment to run coturn alongside the stack. TURN needs its ports directly
+  # reachable, so host networking is the simplest correct setup. Open UDP 3478
+  # and the relay range (49160-49200) in your server firewall, then point
+  # WEBRTC_ICE_SERVERS (above) at it. Full config notes in DEPLOY.md.
+  #
+  # coturn:
+  #   image: coturn/coturn:latest
+  #   network_mode: host
+  #   restart: unless-stopped
+  #   command: >
+  #     -n
+  #     --listening-port=3478
+  #     --min-port=49160 --max-port=49200
+  #     --realm=turn.yourdomain.com
+  #     --external-ip=$$(detect-external-ip)
+  #     --user=${TURN_USER}:${TURN_PASSWORD}
+  #     --lt-cred-mech
+  #     --no-tls --no-dtls
