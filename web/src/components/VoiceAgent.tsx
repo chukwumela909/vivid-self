@@ -70,6 +70,9 @@ type AgentStatus = "idle" | "listening" | "thinking" | "speaking" | "error";
 
 type TranscriptLine = { id: number; role: "user" | "bot"; text: string };
 
+// A pending request from the bot to show a text-input box (request_user_input).
+type InputRequest = { id: string; prompt: string; label?: string };
+
 const STATUS_META: Record<AgentStatus, { label: string; color: string }> = {
   idle: { label: "Idle", color: "#6b7280" },
   listening: { label: "Listening", color: "#22c55e" },
@@ -77,6 +80,74 @@ const STATUS_META: Record<AgentStatus, { label: string; color: string }> = {
   speaking: { label: "Speaking", color: "#3b82f6" },
   error: { label: "Error", color: "#ef4444" },
 };
+
+/**
+ * Modal text box the bot pops up via the request_user_input tool. Owns its own
+ * draft text so keystrokes don't re-render the whole voice UI. onSubmit receives
+ * the typed value; onCancel passes null back to the bot.
+ */
+function InputModal({
+  request,
+  onSubmit,
+  onCancel,
+}: {
+  request: InputRequest;
+  onSubmit: (value: string) => void;
+  onCancel: () => void;
+}) {
+  const [value, setValue] = useState("");
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    inputRef.current?.focus();
+  }, []);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+      role="dialog"
+      aria-modal="true"
+      onKeyDown={(e) => {
+        if (e.key === "Escape") onCancel();
+      }}
+    >
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          if (value.trim()) onSubmit(value.trim());
+        }}
+        className="w-full max-w-sm rounded-xl bg-white p-5 shadow-xl dark:bg-gray-900"
+      >
+        <p className="mb-3 text-sm font-medium text-gray-900 dark:text-gray-100">
+          {request.prompt || "Type a value"}
+        </p>
+        <input
+          ref={inputRef}
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          placeholder={request.label ?? ""}
+          className="mb-4 w-full rounded-md border border-gray-300 px-3 py-2 text-sm text-gray-900 outline-none focus:border-blue-500 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
+        />
+        <div className="flex justify-end gap-2">
+          <button
+            type="button"
+            onClick={onCancel}
+            className="rounded-md border border-gray-300 px-3 py-1.5 text-sm dark:border-gray-600"
+          >
+            Cancel
+          </button>
+          <button
+            type="submit"
+            disabled={!value.trim()}
+            className="rounded-md bg-blue-600 px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"
+          >
+            Done
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
 
 /**
  * Inner UI. Assumes it is rendered inside <PipecatClientProvider>.
@@ -90,6 +161,7 @@ function VoiceAgentInner() {
   const [conversing, setConversing] = useState(false);
   const [lines, setLines] = useState<TranscriptLine[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [inputRequest, setInputRequest] = useState<InputRequest | null>(null);
   const lineId = useRef(0);
   const transcriptEndRef = useRef<HTMLDivElement>(null);
 
@@ -150,6 +222,29 @@ function VoiceAgentInner() {
       setStatus("error");
       setError(typeof e === "string" ? e : "Voice pipeline error");
     }, []),
+  );
+  // The bot drives the input box (request_user_input tool) via server messages:
+  // one to open it, one to close it (on timeout, or when the user speaks over it
+  // / asks to remove it). close_user_input with no id closes whatever's open.
+  useVoiceEvent(
+    RTVIEvent.ServerMessage,
+    useCallback((data: { type?: string; id?: string; prompt?: string; label?: string }) => {
+      if (data?.type === "request_user_input" && data.id) {
+        setInputRequest({ id: data.id, prompt: data.prompt ?? "", label: data.label });
+      } else if (data?.type === "close_user_input") {
+        setInputRequest((cur) => (!data.id || cur?.id === data.id ? null : cur));
+      }
+    }, []),
+  );
+
+  // Reply to a request_user_input box: send the typed value back (null = cancel)
+  // and dismiss the modal. The bot's parked tool call resolves with this value.
+  const respondToInput = useCallback(
+    (id: string, value: string | null) => {
+      client?.sendClientMessage("user_input_response", { id, value });
+      setInputRequest(null);
+    },
+    [client],
   );
 
   useEffect(() => {
@@ -308,6 +403,14 @@ function VoiceAgentInner() {
         )}
         <div ref={transcriptEndRef} />
       </div>
+
+      {inputRequest && (
+        <InputModal
+          request={inputRequest}
+          onSubmit={(value) => respondToInput(inputRequest.id, value)}
+          onCancel={() => respondToInput(inputRequest.id, null)}
+        />
+      )}
     </div>
   );
 }
