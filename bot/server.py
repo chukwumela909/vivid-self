@@ -1,8 +1,9 @@
 """FastAPI signaling server for the SmallWebRTC voice bot.
 
-Exposes POST /api/offer for WebRTC SDP exchange. The browser's Pipecat
-SmallWebRTC transport connects here directly; provider API keys never leave
-this process. One bot pipeline is spawned per peer connection.
+The browser's Pipecat SmallWebRTC transport speaks two methods against
+/api/offer: POST carries the SDP offer, PATCH trickles ICE candidates. Both
+are delegated to Pipecat's SmallWebRTCRequestHandler. Provider API keys never
+leave this process; one bot pipeline is spawned per peer connection.
 """
 
 import json
@@ -13,7 +14,13 @@ from fastapi import BackgroundTasks, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
-from pipecat.transports.smallwebrtc.connection import IceServer, SmallWebRTCConnection
+from pipecat.transports.smallwebrtc.connection import IceServer
+from pipecat.transports.smallwebrtc.request_handler import (
+    IceCandidate,
+    SmallWebRTCPatchRequest,
+    SmallWebRTCRequest,
+    SmallWebRTCRequestHandler,
+)
 
 from bot import run_bot
 
@@ -62,12 +69,13 @@ def _load_ice_servers() -> list[IceServer]:
 
 ICE_SERVERS = _load_ice_servers()
 
-# Active connections keyed by peer-connection id (for renegotiation).
-connections: dict[str, SmallWebRTCConnection] = {}
+# Handles connection lifecycle, renegotiation, and ICE candidate patches.
+webrtc = SmallWebRTCRequestHandler(ice_servers=ICE_SERVERS)
 
 app = FastAPI()
 
-# Dev CORS: the Next.js app (http://localhost:3000) calls this from the browser.
+# CORS: the Next.js app calls this from the browser. Tighten allow_origins to
+# your web domain in production if you like.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -83,28 +91,23 @@ async def health():
 
 @app.post("/api/offer")
 async def offer(request: dict, background_tasks: BackgroundTasks):
-    pc_id = request.get("pc_id")
+    # Spawn the pipeline only for a brand-new connection (not on renegotiation).
+    # add_task runs after the answer is returned, so the offer isn't blocked.
+    async def on_new_connection(connection):
+        background_tasks.add_task(run_bot, connection)
 
-    if pc_id and pc_id in connections:
-        conn = connections[pc_id]
-        logger.info(f"Renegotiating existing connection {pc_id}")
-        await conn.renegotiate(
-            sdp=request["sdp"], type=request["type"], restart_pc=request.get("restart_pc", False)
-        )
-    else:
-        conn = SmallWebRTCConnection(ice_servers=ICE_SERVERS)
-        await conn.initialize(sdp=request["sdp"], type=request["type"])
+    return await webrtc.handle_web_request(
+        SmallWebRTCRequest.from_dict(request), on_new_connection
+    )
 
-        @conn.event_handler("closed")
-        async def on_closed(c: SmallWebRTCConnection):
-            logger.info(f"Connection {c.pc_id} closed")
-            connections.pop(c.pc_id, None)
 
-        connections[conn.pc_id] = conn
-        background_tasks.add_task(run_bot, conn)
-
-    answer = conn.get_answer()
-    return answer
+@app.patch("/api/offer")
+async def offer_patch(request: dict):
+    candidates = [IceCandidate(**c) for c in request.get("candidates", [])]
+    await webrtc.handle_patch_request(
+        SmallWebRTCPatchRequest(pc_id=request["pc_id"], candidates=candidates)
+    )
+    return {"status": "ok"}
 
 
 if __name__ == "__main__":
