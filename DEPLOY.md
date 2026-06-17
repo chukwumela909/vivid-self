@@ -7,8 +7,15 @@ Two services from one repo:
 | `bot/`  | Python 3.12 / FastAPI | 7860 | WebRTC signaling (`/api/offer`) + voice pipeline |
 | `web/`  | Next.js (standalone)  | 3000 | Browser client |
 
-The transport stays **SmallWebRTC** — no switch to Daily required. The only
-production concern is the WebRTC **media** path (see "WebRTC media" below).
+You can run either of two media transports, switched by env var:
+
+- **`daily` (recommended for cloud)** — bot and browser join a Daily room;
+  Daily provides the media infra (SFU + TURN), so there's **no NAT/ICE/coturn
+  setup**. Needs `DAILY_API_KEY`. Free tier ~10,000 participant-min/month.
+- **`smallwebrtc`** — peer-to-peer; no third party, but media must traverse NAT
+  (see "WebRTC media" below), which means a TURN server in most cloud setups.
+
+Set `TRANSPORT` (bot) and `NEXT_PUBLIC_TRANSPORT` (web) to the **same** value.
 
 ---
 
@@ -50,13 +57,25 @@ You can deploy either way:
 | `GROQ_MODEL` | |
 | `DEEPGRAM_MODEL` | defaults to `nova-3` |
 | `LLM_PROVIDER` | defaults to `groq` |
-| `WEBRTC_ICE_SERVERS` | JSON array of STUN/TURN servers — see below |
+| `TRANSPORT` | `daily` or `smallwebrtc` (default) |
+| `DAILY_API_KEY` | required when `TRANSPORT=daily` |
+| `WEBRTC_ICE_SERVERS` | only for `smallwebrtc`: JSON array of STUN/TURN servers — see below |
 
-**web:**
+**web (all `NEXT_PUBLIC_*` are build-time — set as Coolify *Build Variables*, not runtime env):**
 
 | Var | Notes |
 |---|---|
-| `NEXT_PUBLIC_BOT_OFFER_URL` | **Build-time.** Set as a *Build Variable* in Coolify, value `https://<bot-domain>/api/offer`. Next.js inlines `NEXT_PUBLIC_*` at build, so a runtime-only var won't work. |
+| `NEXT_PUBLIC_BOT_OFFER_URL` | `https://<bot-domain>/api/offer`. For Daily, the bot's `/connect` URL is derived from this same origin. |
+| `NEXT_PUBLIC_TRANSPORT` | `daily` or `smallwebrtc` — must match the bot's `TRANSPORT`. |
+| `NEXT_PUBLIC_WEBRTC_ICE_SERVERS` | only for `smallwebrtc`: JSON ICE servers, must match the bot's `WEBRTC_ICE_SERVERS`. |
+
+### Using Daily (recommended)
+
+1. Set `TRANSPORT=daily` + `DAILY_API_KEY` on the bot.
+2. Set `NEXT_PUBLIC_TRANSPORT=daily` on the web build.
+3. Redeploy both. No ICE/TURN config needed — skip the "WebRTC media" section.
+
+Verify: `curl https://<bot-domain>/health` returns `{"status":"ok","transport":"daily"}`.
 
 ## 4. Domains & HTTPS
 

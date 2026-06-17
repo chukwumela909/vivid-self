@@ -12,6 +12,7 @@ import {
   SmallWebRTCTransport,
   WavMediaManager,
 } from "@pipecat-ai/small-webrtc-transport";
+import { DailyTransport } from "@pipecat-ai/daily-transport";
 import {
   PipecatClientProvider,
   PipecatClientAudio,
@@ -41,6 +42,21 @@ function parseIceServers(): RTCIceServer[] {
 }
 
 const ICE_SERVERS = parseIceServers();
+
+// Which transport the browser uses. Must match the bot's TRANSPORT env.
+// "daily" joins a Daily room (managed infra, no NAT issues); "smallwebrtc" is
+// peer-to-peer against the bot's /api/offer endpoint.
+const TRANSPORT = (process.env.NEXT_PUBLIC_TRANSPORT ?? "smallwebrtc").toLowerCase();
+
+// For Daily, the bot exposes /connect (returns room URL + token) instead of
+// /api/offer. Derive it from the offer URL's origin so only one URL is configured.
+const CONNECT_URL = (() => {
+  try {
+    return new URL("/connect", OFFER_URL).toString();
+  } catch {
+    return "http://localhost:7860/connect";
+  }
+})();
 
 // @pipecat-ai/client-react bundles its own copy of the RTVIEvent enum (parcel
 // inlines it), which is nominally distinct from the one exported by client-js.
@@ -154,7 +170,18 @@ function VoiceAgentInner() {
       );
     }, 12000);
     try {
-      await client.connect({ webrtcRequestParams: { endpoint: OFFER_URL } });
+      if (TRANSPORT === "daily") {
+        // Ask the bot to create a Daily room + token, then join it.
+        const res = await fetch(CONNECT_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: "{}",
+        });
+        if (!res.ok) throw new Error(`Bot /connect failed: ${res.status}`);
+        await client.connect(await res.json());
+      } else {
+        await client.connect({ webrtcRequestParams: { endpoint: OFFER_URL } });
+      }
       // Listen continuously so the bot's wake filter can hear "Hey Vivid".
       client.enableMic(true);
       setConversing(true);
@@ -300,10 +327,13 @@ export default function VoiceAgent() {
       // SmallWebRTCTransport defaults to DailyMediaManager, which spins up a
       // Daily call object (loads Daily's call-machine bundle) and hangs on a
       // pure SmallWebRTC setup. WavMediaManager uses plain browser media.
-      transport: new SmallWebRTCTransport({
-        mediaManager: new WavMediaManager(),
-        iceServers: ICE_SERVERS,
-      }),
+      transport:
+        TRANSPORT === "daily"
+          ? new DailyTransport()
+          : new SmallWebRTCTransport({
+              mediaManager: new WavMediaManager(),
+              iceServers: ICE_SERVERS,
+            }),
       enableMic: false, // connect receive-only; PTT adds the mic track live
       enableCam: false,
     });

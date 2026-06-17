@@ -17,6 +17,10 @@ services:
       GROQ_MODEL: ${GROQ_MODEL}
       LLM_PROVIDER: ${LLM_PROVIDER:-groq}
       BOT_PORT: "7860"
+      # Media transport: "smallwebrtc" (default) or "daily". Daily needs DAILY_API_KEY
+      # and sidesteps all the NAT/TURN setup below — recommended for cloud.
+      TRANSPORT: ${TRANSPORT:-smallwebrtc}
+      DAILY_API_KEY: ${DAILY_API_KEY}
       # WebRTC ICE — JSON array of STUN/TURN servers. STUN alone is enough for
       # same-network testing; add your TURN entry (see coturn below) for
       # reliable media from this bridged container. See DEPLOY.md.
@@ -34,6 +38,8 @@ services:
         NEXT_PUBLIC_BOT_OFFER_URL: ${NEXT_PUBLIC_BOT_OFFER_URL}
         # Build-time: browser ICE servers, must match the bot's WEBRTC_ICE_SERVERS.
         NEXT_PUBLIC_WEBRTC_ICE_SERVERS: ${NEXT_PUBLIC_WEBRTC_ICE_SERVERS:-["stun:stun.l.google.com:19302"]}
+        # Build-time: transport, must match the bot's TRANSPORT.
+        NEXT_PUBLIC_TRANSPORT: ${NEXT_PUBLIC_TRANSPORT:-smallwebrtc}
     expose:
       - "3000"
     depends_on:

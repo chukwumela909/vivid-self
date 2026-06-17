@@ -23,6 +23,9 @@ WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+# Daily transport (Linux-only wheels), used when TRANSPORT=daily. Kept out of
+# requirements.txt so local Windows `pip install` still works (no daily wheels).
+RUN pip install --no-cache-dir "pipecat-ai[daily]==1.2.1"
 
 COPY . .
 

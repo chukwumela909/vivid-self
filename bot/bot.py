@@ -27,8 +27,6 @@ from pipecat.processors.frameworks.rtvi import RTVIObserver, RTVIProcessor
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.deepgram.stt import DeepgramSTTService, LiveOptions
 from pipecat.services.groq.llm import GroqLLMService
-from pipecat.transports.base_transport import TransportParams
-from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 
 # Load provider keys from the repo-root .env (one level above /bot).
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
@@ -43,16 +41,12 @@ SYSTEM_PROMPT = (
 )
 
 
-async def run_bot(webrtc_connection):
-    """Build and run the voice pipeline for a single SmallWebRTC connection."""
-    transport = SmallWebRTCTransport(
-        webrtc_connection=webrtc_connection,
-        params=TransportParams(
-            audio_in_enabled=True,
-            audio_out_enabled=True,
-        ),
-    )
+async def run_bot(transport):
+    """Build and run the voice pipeline over the given Pipecat transport.
 
+    The transport (SmallWebRTC or Daily) is constructed by the caller, so this
+    pipeline stays transport-agnostic.
+    """
     # VAD drives turn-taking and interruption. Lower stop_secs => the bot decides
     # the user is done sooner (snappier), at some risk of clipping long pauses.
     vad = VADProcessor(
@@ -138,7 +132,8 @@ async def run_bot(webrtc_connection):
         await task.queue_frames([LLMRunFrame()])
 
     @transport.event_handler("on_client_disconnected")
-    async def on_client_disconnected(_transport, _client):
+    async def on_client_disconnected(*_args):
+        # SmallWebRTC and Daily pass different args; we only need the signal.
         logger.info("Client disconnected; cancelling task.")
         await task.cancel()
 
