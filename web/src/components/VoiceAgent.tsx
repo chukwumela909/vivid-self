@@ -348,35 +348,47 @@ function VoiceAgentInner() {
     setCamActive(false);
   }, []);
 
-  // Grab one frame for the bot's `look` tool: draw the current video frame to a
-  // canvas, downscale (longest side -> MAX_FRAME_PX), JPEG-encode, and send the
-  // base64 back over the data channel. On any failure send image:null so the bot's
-  // parked tool call resolves as "no image" rather than waiting out its timeout.
+  // Grab one downscaled JPEG frame from the camera as base64 (no data: prefix), or
+  // null if the camera is unavailable / denied / not ready yet.
+  const grabFrame = useCallback(async (): Promise<string | null> => {
+    try {
+      const video = await ensureCamera();
+      const vw = video.videoWidth;
+      const vh = video.videoHeight;
+      if (!vw || !vh) return null;
+      const scale = Math.min(1, MAX_FRAME_PX / Math.max(vw, vh));
+      const w = Math.round(vw * scale);
+      const h = Math.round(vh * scale);
+      const canvas = document.createElement("canvas");
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return null;
+      ctx.drawImage(video, 0, 0, w, h);
+      return canvas.toDataURL("image/jpeg", 0.6).split(",")[1] || null;
+    } catch (e) {
+      console.warn("[voice] camera frame capture failed:", e);
+      return null;
+    }
+  }, [ensureCamera]);
+
+  // Tool path: the bot's `look` tool asked for a frame — send it back keyed by id
+  // (null if we couldn't grab one, so the bot's parked call resolves as "no image").
   const captureFrame = useCallback(
     async (id: string) => {
-      try {
-        const video = await ensureCamera();
-        const vw = video.videoWidth;
-        const vh = video.videoHeight;
-        if (!vw || !vh) throw new Error("no video frame yet");
-        const scale = Math.min(1, MAX_FRAME_PX / Math.max(vw, vh));
-        const w = Math.round(vw * scale);
-        const h = Math.round(vh * scale);
-        const canvas = document.createElement("canvas");
-        canvas.width = w;
-        canvas.height = h;
-        const ctx = canvas.getContext("2d");
-        if (!ctx) throw new Error("no 2d canvas context");
-        ctx.drawImage(video, 0, 0, w, h);
-        const b64 = canvas.toDataURL("image/jpeg", 0.6).split(",")[1] || null;
-        client?.sendClientMessage("frame_response", { id, image: b64 });
-      } catch (e) {
-        console.warn("[voice] camera frame capture failed:", e);
-        client?.sendClientMessage("frame_response", { id, image: null });
-      }
+      const image = await grabFrame();
+      client?.sendClientMessage("frame_response", { id, image });
     },
-    [client, ensureCamera],
+    [client, grabFrame],
   );
+
+  // Manual "Look now" button: grab a frame and ask the bot to describe it now,
+  // bypassing the LLM's tool-calling. The bot runs vision and has Vivid speak what
+  // she sees. Sends image:null if the camera is unavailable so Vivid can say so.
+  const manualLook = useCallback(async () => {
+    const image = await grabFrame();
+    client?.sendClientMessage("manual_look", { image });
+  }, [client, grabFrame]);
 
   // --- RTVI events -> status + transcript ----------------------------------
   useVoiceEvent(
@@ -734,6 +746,18 @@ function VoiceAgentInner() {
         {conversing
           ? "Listening — say “Hey Vivid” · tap to mute"
           : "Muted — tap to listen"}
+      </button>
+
+      {/* Manual vision trigger — grabs a camera frame and asks Vivid to describe it,
+          bypassing the LLM's tool-calling (handy for testing, or when the model
+          won't call `look` itself). Opens the camera (and prompts for permission)
+          on first use. */}
+      <button
+        disabled={!connected}
+        onClick={manualLook}
+        className="select-none self-start rounded-md border border-gray-400 px-4 py-2 text-sm font-medium disabled:opacity-40"
+      >
+        👁 Look now
       </button>
 
       {error && (

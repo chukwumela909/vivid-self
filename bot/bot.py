@@ -855,6 +855,47 @@ async def run_bot(
             future = pending_frames.get(data.get("id"))
             if future and not future.done():
                 future.set_result(img)
+        elif message.type == "manual_look":
+            # Manual "Look now" button: the browser sends a camera frame directly,
+            # bypassing the LLM's tool-calling. We run vision off-pipeline, then inject
+            # the result as a system note and kick an LLM turn so Vivid speaks it in
+            # her own voice. (`task` is assigned further below, but it's always bound
+            # by the time a client message can arrive.)
+            image = data.get("image")
+            logger.info(
+                f"manual_look from browser ({'image received' if image else 'no image'})"
+            )
+            await llm.push_frame(TTSSpeakFrame(_filler(LOOKING_FILLERS)))
+            observation = None
+            if image:
+                try:
+                    observation = await _describe_image(image, "What do you see?")
+                except Exception:
+                    logger.exception("manual_look: vision request failed")
+            if observation:
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "The user just pointed their camera at something and tapped "
+                            f"Look. Here's what's visible: {observation}. Tell them what "
+                            "you see, naturally and in your own voice — don't mention "
+                            "cameras or tools."
+                        ),
+                    }
+                )
+            else:
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "The user tapped Look but no clear camera image came "
+                            "through. In one short line, say you couldn't quite see and "
+                            "ask them to try again."
+                        ),
+                    }
+                )
+            await task.queue_frames([LLMRunFrame()])
 
     # Optional "agent re-engages when you go quiet" — reinforces story mode's
     # leading feel. Off unless STORY_IDLE_SECS (or the style default) is > 0; each
